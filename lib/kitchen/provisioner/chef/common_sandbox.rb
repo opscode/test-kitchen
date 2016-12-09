@@ -56,6 +56,7 @@ module Kitchen
           prepare(:nodes)
           prepare(:roles)
           prepare(:clients)
+          prepare(:users)
           prepare(
             :secret,
             :type => :file,
