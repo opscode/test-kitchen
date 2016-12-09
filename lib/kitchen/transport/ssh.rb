@@ -55,7 +55,10 @@ module Kitchen
       default_config :max_wait_until_ready, 600
 
       default_config :ssh_gateway, nil
+      default_config :ssh_gateway_port, 22
       default_config :ssh_gateway_username, nil
+
+      default_config :target_host, nil
 
       default_config :ssh_key, nil
       expand_path_for :ssh_key
@@ -86,6 +89,7 @@ module Kitchen
       # (see Base#connection)
       def connection(state, &block)
         options = connection_options(config.to_hash.merge(state))
+        options[:hostname] = config[:target_host] if config[:target_host]
 
         if @connection && @connection_options == options
           reuse_connection(&block)
@@ -149,7 +153,7 @@ module Kitchen
           if ssh_gateway
             gateway_command = "ssh -q #{ssh_gateway_username}@#{ssh_gateway} nc #{hostname} #{port}"
             # Should support other ports than 22 for ssh gateways
-            args += %W[ -o ProxyCommand=#{gateway_command} -p 22 ]
+            args += %W[ -o ProxyCommand=#{gateway_command} -p #{ssh_gateway_port} ]
           end
           Array(options[:keys]).each { |ssh_key| args += %W[ -i #{ssh_key} ] }
           args += %W[ -p #{port} ]
@@ -240,6 +244,11 @@ module Kitchen
         # @api private
         attr_reader :ssh_gateway
 
+        # @return [Integer] The port on the ssh gateway to use when connecting
+        #   to the remote SSH host
+        # @api private
+        attr_reader :ssh_gateway_port
+
         # @return [String] The username to use when using an ssh gateway
         # @api private
         attr_reader :ssh_gateway_username
@@ -257,8 +266,9 @@ module Kitchen
         # @api private
         def establish_connection_via_gateway(opts)
           retry_connection(opts) do
-            Net::SSH::Gateway.new(ssh_gateway,
-              ssh_gateway_username, options).ssh(hostname, username, options)
+            Net::SSH::Gateway.new(ssh_gateway, ssh_gateway_username,
+              options.merge({ :port => ssh_gateway_port }))
+                .ssh(hostname, username, options)
           end
         end
 
@@ -292,7 +302,7 @@ module Kitchen
         # @api private
         def retry_connection(opts)
           log_msg = "[SSH] opening connection to #{self}"
-          log_msg += " via #{ssh_gateway_username}@#{ssh_gateway}" if ssh_gateway
+          log_msg += " via #{ssh_gateway_username}@#{ssh_gateway}:#{ssh_gateway_port}" if ssh_gateway
           logger.debug(log_msg)
           yield
         rescue *RESCUE_EXCEPTIONS_ON_ESTABLISH => e
@@ -354,6 +364,7 @@ module Kitchen
           @max_ssh_sessions       = @options.delete(:max_ssh_sessions)
           @max_wait_until_ready   = @options.delete(:max_wait_until_ready)
           @ssh_gateway            = @options.delete(:ssh_gateway)
+          @ssh_gateway_port       = @options.delete(:ssh_gateway_port)
           @ssh_gateway_username   = @options.delete(:ssh_gateway_username)
         end
 
@@ -413,11 +424,11 @@ module Kitchen
           :max_ssh_sessions       => data[:max_ssh_sessions],
           :max_wait_until_ready   => data[:max_wait_until_ready],
           :ssh_gateway            => data[:ssh_gateway],
+          :ssh_gateway_port       => data[:ssh_gateway_port],
           :ssh_gateway_username   => data[:ssh_gateway_username]
         }
 
         if data[:ssh_key] && !data[:password]
-          opts[:keys_only] = true
           opts[:keys] = Array(data[:ssh_key])
           opts[:auth_methods] = ["publickey"]
         end
