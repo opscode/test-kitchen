@@ -31,36 +31,65 @@ module Kitchen
 
       default_config :sleep, 0
       default_config :command, "true"
+      default_config :environment, {}
       default_config :shellout_opts, {}
       default_config :live_stream, $stdout
       default_config :remote_exec, false
+      default_config :sudo, false # 'false' for backwards compatability
 
       # (see Base#call)
       def call(state)
         info("[#{name}] Verify on instance #{instance.name} with state=#{state}")
         sleep_if_set
-        merge_state_to_env(state)
+        @merged_environment = state_to_env(state).merge(config[:environment] || {})
+
         if config[:remote_exec]
-          instance.transport.connection(state) do |conn|
-            conn.execute(config[:command])
-          end
+          super
         else
           shellout
         end
         debug("[#{name}] Verify completed.")
       end
 
-      # for legacy drivers.
+      # (see Base#create_sandbox)
+      def create_sandbox
+        super
+        prepare_helpers
+        prepare_suite
+      end
+
+      # (see Base#init_command)
+      def init_command
+        return nil unless config[:remote_exec]
+        root = config[:root_path]
+
+        code = if powershell_shell?
+                 Util.outdent!(<<-POWERSHELL)
+                   if (-Not (Test-Path "#{root}")) {
+                     New-Item "#{root}" -ItemType directory | Out-Null
+                   }
+                 POWERSHELL
+               else
+                 "mkdir -p #{root}"
+               end
+
+        wrap_shell_code(prefix_command(code))
+      end
+
+      # (see Base#run_command)
       def run_command
         if config[:remote_exec]
-          config[:command]
+          remote_command
         else
+          warn "DEPRECATED: Legacy call to Shell Verifier #run_command detected.  Do not call this method directly."
           shellout
           nil
         end
       end
 
       private
+
+      attr_reader :merged_environment
 
       # Sleep for a period of time, if a value is set in the config.
       #
@@ -72,8 +101,29 @@ module Kitchen
         end
       end
 
+      # Merges environment variables with :shellout_opts as specified in the config
+      #
+      # @return [Hash] options to be passed to shellout
+      # @api private
+      def shellout_opts
+        config[:shellout_opts].dup.tap do |options|
+          options[:environment] = (merged_environment || {}).merge(options[:environment] || {})
+        end
+      end
+
+      # Wraps command as necessary to honor Base options (proxy, sudo, command_prefix)
+      #
+      # @api private
+      def build_command(command)
+        command = sudo(command) unless powershell_shell?
+        wrap_shell_code(prefix_command(command))
+      end
+
+      # Executes ShellOut with the appropriate options
+      #
+      # @api private
       def shellout
-        cmd = Mixlib::ShellOut.new(config[:command], config[:shellout_opts])
+        cmd = Mixlib::ShellOut.new(build_command(config[:command]), shellout_opts)
         cmd.live_stream = config[:live_stream]
         cmd.run_command
         begin
@@ -83,16 +133,79 @@ module Kitchen
         end
       end
 
-      def merge_state_to_env(state)
-        env_state = { environment: {} }
-        env_state[:environment]["KITCHEN_INSTANCE"] = instance.name
-        env_state[:environment]["KITCHEN_PLATFORM"] = instance.platform.name
-        env_state[:environment]["KITCHEN_SUITE"] = instance.suite.name
-        state.each_pair do |key, value|
-          env_state[:environment]["KITCHEN_" + key.to_s.upcase] = value.to_s
+      # Wraps and prepares config[:command] as necessary for remote execution
+      #
+      # @return [String] command to be executed remotely
+      # @api private
+      def remote_command
+        command = Util.list_directory(sandbox_path).any? ? "cd #{config[:root_path]}\n" : ""
+        merged_environment.each do |k, v|
+          val = powershell_shell? ? v.gsub('"', '""') : v.gsub('"', '\\"')
+          command << shell_env_var(k, val) << "\n"
         end
-        config[:shellout_opts].merge!(env_state)
+        command << build_command(config[:command])
       end
+
+      # Merges primary environment settings with settings calculated from the state
+      #
+      # @return [Hash] system environment
+      # @api private
+      def state_to_env(state)
+        {}.tap do |env|
+          env["KITCHEN_INSTANCE"] = instance.name
+          env["KITCHEN_PLATFORM"] = instance.platform.name
+          env["KITCHEN_SUITE"] = instance.suite.name
+          state.each_pair do |key, value|
+            env["KITCHEN_" + key.to_s.upcase] = value.to_s
+          end
+        end
+      end
+
+      # Returns an Array of common helper filenames currently residing on the
+      # local workstation.
+      #
+      # @return [Array<String>] array of helper files
+      # @api private
+      def helper_files
+        Util.safe_glob(File.join(config[:test_base_path], "helpers"), "**/*").reject { |f| File.directory?(f) }
+      end
+
+      # Returns an Array of test suite filenames for the related suite currently
+      # residing on the local workstation.
+      #
+      # @return [Array<String>] array of suite files
+      # @api private
+      def local_suite_files
+        Util.safe_glob(File.join(config[:test_base_path], config[:suite_name]), "**/*").reject { |f| File.directory?(f) }
+      end
+
+      # Copies all common testing helper files into the suites directory in
+      # the sandbox.
+      #
+      # @api private
+      def prepare_helpers
+        base = File.join(config[:test_base_path], "helpers")
+
+        helper_files.each do |src|
+          dest = File.join(sandbox_path, src.sub("#{base}/", ""))
+          FileUtils.mkdir_p(File.dirname(dest))
+          FileUtils.cp(src, dest, preserve: true)
+        end
+      end
+
+      # Copies all test suite files into the suites directory in the sandbox.
+      #
+      # @api private
+      def prepare_suite
+        base = File.join(config[:test_base_path], config[:suite_name])
+
+        local_suite_files.each do |src|
+          dest = File.join(sandbox_path, src.sub("#{base}/", ""))
+          FileUtils.mkdir_p(File.dirname(dest))
+          FileUtils.cp(src, dest, preserve: true)
+        end
+      end
+
     end
   end
 end
